@@ -313,7 +313,7 @@ def _parse_args():
                    help="Q head dim (kernel now supports variable DIM via constexpr parameter)")
     p.add_argument("--kv-dim", dest="Dkv", type=int, default=None,
                    help="KV head dim (default: same as --D).  Use e.g. --D 192 --kv-dim 128 for split Q/KV dims.")
-    p.add_argument("--causal", action="store_true", help="causal masking")
+    p.add_argument("--causal", action="store_true", default=True, help="causal masking")
     p.add_argument("--combine-batch", type=int, default=_DEFAULT_COMBINE_BATCH,
                    help="combine_batch passed to flash_attention_fwd")
     p.add_argument("--warmup", type=int, default=_DEFAULT_WARMUP, help="warmup iterations")
