@@ -20,6 +20,11 @@
 #include "incubated/Conversion/TritonToLinalgIncubated/Passes.h"
 #include "incubated/Conversion/TritonToStructuredIncubated/Passes.h"
 #include "incubated/Conversion/TritonToUnstructureIncubated/Passes.h"
+#include "triton-shared/Conversion/TensorViewLowering/Passes.h"
+#include "triton-shared/Conversion/TritonToTensorView/Matcher.h"
+#include "triton-shared/Conversion/TritonToTensorView/Passes.h"
+#include "triton-shared/Conversion/TritonToTensorView/TensorViewBuilder.h"
+#include "triton-shared/Dialect/TensorView/IR/TensorViewDialect.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
 #include "ascend/include/DynamicCVPipeline/Passes.h"
@@ -31,6 +36,7 @@
 
 #include <pybind11/pybind11.h>
 
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Config/llvm-config.h"
 
 namespace py = pybind11;
@@ -335,6 +341,117 @@ void init_triton_ascend_ir(py::module &&m) {
              auto annotationOp = self.create<triton::ascend::AnnotationOp>(ptr);
              annotationOp->setAttr(self.getBuilder().getStringAttr(attrKey),
                                    attrVal);
+           })
+      //===----------------------------------------------------------------===//
+      // TensorView ptr matcher hooks for supported discrete accesses.
+      //===----------------------------------------------------------------===//
+      .def("try_tv_load",
+           [](TritonOpBuilder &self, Value ptr, py::object maskObj,
+              Type resultTy) -> py::object {
+             Value mask = maskObj.is_none() ? Value() : maskObj.cast<Value>();
+             Value result = triton::tv::tryEmitTvLoad(
+                 self.getBuilder(), self.getLastLoc(), ptr, mask, resultTy);
+             if (!result)
+               return py::none();
+             return py::cast(result);
+           })
+      .def("try_tv_store",
+           [](TritonOpBuilder &self, Value ptr, Value value,
+              py::object maskObj) -> bool {
+             Value mask = maskObj.is_none() ? Value() : maskObj.cast<Value>();
+             return triton::tv::tryEmitTvStore(
+                 self.getBuilder(), self.getLastLoc(), ptr, value, mask);
+           })
+      // Retype or bridge a call argument to !tv.ptr.
+      .def("ensure_tv_ptr",
+           [](TritonOpBuilder &self, Value value) -> Value {
+             return triton::tv::ensureTvPtr(value);
+           })
+      //===----------------------------------------------------------------===//
+      // Direct-construction API for `tl.tensor_view`.
+      //===----------------------------------------------------------------===//
+      .def("create_tensor_view",
+           [](TritonOpBuilder &self, Value base, std::vector<Value> shape,
+              std::vector<Value> strides) -> Value {
+             return triton::tv::createTensorViewBase(
+                 self.getBuilder(), self.getLastLoc(), base, shape, strides);
+           })
+      .def("create_partition_view",
+           [](TritonOpBuilder &self, Value baseView, std::vector<int64_t> tile,
+              const std::string &padding) -> Value {
+             auto kind =
+                 llvm::StringSwitch<triton::tv::PadKind>(padding)
+                     .Case("zero", triton::tv::PadKind::Zero)
+                     .Case("nan", triton::tv::PadKind::Nan)
+                     .Case("inf", triton::tv::PadKind::Inf)
+                     .Case("-inf", triton::tv::PadKind::NInf)
+                     .Default(triton::tv::PadKind::Zero);
+             return triton::tv::createPartitionView(
+                 self.getBuilder(), self.getLastLoc(), baseView, tile, kind);
+           })
+      .def("create_strided_view",
+           [](TritonOpBuilder &self, Value baseView, std::vector<int64_t> tile,
+              std::vector<int64_t> traversal,
+              const std::string &padding) -> Value {
+             auto kind =
+                 llvm::StringSwitch<triton::tv::PadKind>(padding)
+                     .Case("zero", triton::tv::PadKind::Zero)
+                     .Case("nan", triton::tv::PadKind::Nan)
+                     .Case("inf", triton::tv::PadKind::Inf)
+                     .Case("-inf", triton::tv::PadKind::NInf)
+                     .Default(triton::tv::PadKind::Zero);
+             return triton::tv::createStridedView(self.getBuilder(),
+                                                  self.getLastLoc(), baseView,
+                                                  tile, traversal, kind);
+           })
+      .def("tensor_view_load",
+           [](TritonOpBuilder &self, Value view, std::vector<Value> index,
+              std::vector<int64_t> tile, std::vector<int64_t> traversal,
+              std::vector<int64_t> sparseDim, Type resultTy,
+              py::object maskObj) -> Value {
+             Value mask = maskObj.is_none() ? Value() : maskObj.cast<Value>();
+             return triton::tv::tensorViewLoad(self.getBuilder(),
+                                               self.getLastLoc(), view, tile,
+                                               traversal, sparseDim, index,
+                                               resultTy, mask);
+           })
+      .def("tensor_view_store",
+           [](TritonOpBuilder &self, Value view, Value value,
+              std::vector<Value> index, std::vector<int64_t> tile,
+              std::vector<int64_t> traversal, std::vector<int64_t> sparseDim,
+              py::object maskObj) -> void {
+             Value mask = maskObj.is_none() ? Value() : maskObj.cast<Value>();
+             triton::tv::tensorViewStore(self.getBuilder(), self.getLastLoc(),
+                                         view, tile, traversal, sparseDim,
+                                         index, value, mask);
+           })
+      // Extract tile shape from a tensor_view's encoding attribute.
+      // Returns empty vector if the view has no encoding (base view).
+      .def("get_tensor_view_encoding_tile",
+           [](TritonOpBuilder &self, Value view) -> std::vector<int64_t> {
+             auto tvTy = cast<triton::tv::TensorViewType>(view.getType());
+             auto enc = tvTy.getEncoding();
+             if (!enc)
+               return {};
+             if (auto pv = dyn_cast<triton::tv::PartitionViewAttr>(enc))
+               return std::vector<int64_t>(pv.getTile().begin(),
+                                           pv.getTile().end());
+             if (auto sv = dyn_cast<triton::tv::StridedViewAttr>(enc))
+               return std::vector<int64_t>(sv.getTile().begin(),
+                                           sv.getTile().end());
+             if (auto gs = dyn_cast<triton::tv::GatherScatterViewAttr>(enc))
+               return std::vector<int64_t>(gs.getTile().begin(),
+                                           gs.getTile().end());
+             return {};
+           })
+      // Build the fully dynamic TensorView type used across IR boundaries.
+      .def("get_tensor_view_ty",
+           [](TritonOpBuilder &self, Type elementType, int64_t rank) -> Type {
+             llvm::SmallVector<int64_t> dynShape(rank, ShapedType::kDynamic);
+             llvm::SmallVector<int64_t> dynStrides(rank,
+                                                   ShapedType::kDynamic);
+             return triton::tv::TensorViewType::get(
+                 dynShape, elementType, dynStrides, Attribute());
            });
 }
 
@@ -393,6 +510,14 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
     pm.addPass(mlir::triton::createTritonToHIVMPass());
   });
 
+  m.def("add_triton_to_tensor_view", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createTritonToTensorViewPass());
+  });
+
+  m.def("add_tensor_view_lowering", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createTensorViewLoweringPass());
+  });
+
   m.def("add_tileir_to_hivm", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createTileIRToHIVMPass());
   });
@@ -440,7 +565,8 @@ void init_triton_ascend(py::module &&m) {
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
-    registry.insert<mlir::triton::ascend::TritonAscendDialect>();
+    registry.insert<mlir::triton::ascend::TritonAscendDialect,
+                    mlir::triton::tv::TensorViewDialect>();
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });

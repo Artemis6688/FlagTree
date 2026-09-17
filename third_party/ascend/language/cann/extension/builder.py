@@ -81,5 +81,7 @@ def setup_unified_builder(main_builder, ascend_builder):
         "sync_block_wait",
         "create_convert_layout",
         'sync_block_all',
+        # TensorView methods for tile_load/tile_store DSA builtin support
+        'get_tensor_view_encoding_tile',
     ]
     attach_builder_methods(main_builder, ascend_builder, ascend_methods)

@@ -383,3 +383,57 @@ def tile_concat(lhs: tl.tensor, rhs: tl.tensor, dim: int, builder: ir.builder) -
     result_ty = tl.block_type(lhs.dtype, out_shape)
     return tl.tensor(result_handle, result_ty)
 
+def _convert_index_to_ir(elem, builder: ir.builder):
+    """Convert a single index element to an IR Value (i32 scalar)."""
+    elem = tl._unwrap_if_constexpr(elem)
+    if isinstance(elem, int):
+        return builder.get_int32(elem)
+    if isinstance(elem, tl.tensor):
+        return elem.handle
+    raise TypeError(f"Unsupported index element type: {type(elem)}")
+
+
+def _prepare_tv_indices(view, index, builder: ir.builder):
+    """Convert index tuple to IR handles and extract tile from view encoding."""
+    enc_tile = builder.get_tensor_view_encoding_tile(view.handle)
+    assert len(enc_tile) > 0, \
+        "tensor_view has no encoding; use `make_partition_view` first"
+    tile = list(enc_tile)
+    rank = len(tile)
+
+    idx = list(index)
+    assert len(idx) == rank, \
+        f"Expected {rank} entries in `index`, got {len(idx)}"
+    index_handles = [_convert_index_to_ir(i, builder) for i in idx]
+    return index_handles, tile
+
+
+def _space_to_ir_attr(space, builder: ir.builder):
+    """Convert a target memory space (e.g. tle.dsa.ascend.UB) to an IR
+    attribute the builder can attach to tile.load/tile.store. `None` maps to a
+    null attribute, which the lowering interprets as the default space (UB)."""
+    if space is None:
+        return builder.dsa_get_null_attr()
+    return space.to_ir(builder)
+
+
+def tile_load(src, index, dst_space, builder: ir.builder) -> tl.tensor:
+    """Load a tile from an encoded tensor_view at the given index into
+    `dst_space` (defaults to UB when unspecified)."""
+    assert index is not None, "`index` is required"
+    index_handles, tile = _prepare_tv_indices(src, index, builder)
+    result_ty = tl.block_type(src.dtype, tile)
+    space_attr = _space_to_ir_attr(dst_space, builder)
+    handle = builder.create_tile_load(
+        src.handle, index_handles, result_ty.to_ir(builder), space_attr)
+    return tl.tensor(handle, result_ty)
+
+
+def tile_store(src, dst, value, index, builder: ir.builder, src_space=None):
+    """Store a tile into an encoded tensor_view at the given index from
+    `src_space` (defaults to UB when unspecified)."""
+    assert value is not None, "`value` is required"
+    assert index is not None, "`index` is required"
+    index_handles, _ = _prepare_tv_indices(src, index, builder)
+    space_attr = _space_to_ir_attr(src_space, builder)
+    builder.create_tile_store(value.handle, src.handle, index_handles, space_attr)

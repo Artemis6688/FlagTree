@@ -41,9 +41,11 @@
 
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "mlir-ext/Dialect/TileIR/IR/TileIRDialect.h"
+#include "triton-shared/Dialect/TensorView/IR/TensorViewDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinDialect.h"
@@ -56,10 +58,12 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/Support/LogicalResult.h"
 
 using namespace mlir;
 namespace tile = mlir::triton::tile;
+namespace tv = mlir::triton::tv;
 namespace hivm = mlir::hivm;
 
 namespace mlir {
@@ -182,6 +186,11 @@ static Value getAsMemRef(Value val, PatternRewriter &rewriter) {
     else
       targetTy = MemRefType::get({ShapedType::kDynamic}, pointeeTy,
                                  MemRefLayoutAttrInterface{}, gmSpace);
+  } else if (auto ptrTy = dyn_cast<tv::PtrType>(val.getType())) {
+    // TensorView pointers are expression-level global pointers. Keep the
+    // function argument in its original type until view construction has
+    // been consumed, and bridge it to a plain 1-D memref here.
+    targetTy = MemRefType::get({ShapedType::kDynamic}, ptrTy.getPointeeType());
   } else
     return val;
   return rewriter
@@ -192,6 +201,359 @@ static Value getAsMemRef(Value val, PatternRewriter &rewriter) {
 static bool isTensorOfPointer(Type ty) {
   auto rankedTy = dyn_cast<RankedTensorType>(ty);
   return rankedTy && isa<triton::PointerType>(rankedTy.getElementType());
+}
+
+//===----------------------------------------------------------------------===//
+// Direct TensorView lowering (PartitionView + StridedView)
+//===----------------------------------------------------------------------===//
+
+// A traced, encoding-neutral description of one GM tile access. PartitionView
+// and StridedView differ only in how far consecutive tiles step apart: a
+// partition tile steps by its own size, a strided tile steps by an explicit
+// traversal stride (windows may overlap or leave gaps). We capture that single
+// degree of freedom in `traversal` -- partition sets `traversal == tile` -- so
+// one lowering path serves both encodings. The read/write extent is always
+// `tile`; only the per-index start offset uses `traversal`.
+struct ViewTileInfo {
+  Value base;
+  Type elementType;
+  SmallVector<int64_t> tile;
+  SmallVector<int64_t> traversal;
+  SmallVector<int64_t> dimMap;
+  SmallVector<int64_t> strideStatic;
+  SmallVector<Value> shape;
+  SmallVector<Value> strides;
+  tv::PadKind padding = tv::PadKind::Zero;
+  bool ok = false;
+};
+
+static Value asIndexValue(OpBuilder &builder, Location loc, Value value) {
+  if (value.getType().isIndex())
+    return value;
+  return builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), value);
+}
+
+// Trace a `tile.load`/`tile.store` operand back to the `tv.make_*_view` that
+// produced it and gather the tile geometry. Handles both partition and strided
+// encodings; for a partition view the traversal stride equals the tile size.
+static ViewTileInfo traceView(Value view, PatternRewriter &rewriter) {
+  ViewTileInfo info;
+  auto viewTy = dyn_cast<tv::TensorViewType>(view.getType());
+  if (!viewTy)
+    return info;
+  Attribute enc = viewTy.getEncoding();
+
+  ArrayRef<int64_t> tile;
+  ArrayRef<int64_t> dimMap;
+  SmallVector<int64_t> traversal;
+  tv::PadKind padding = tv::PadKind::Zero;
+  Value source;
+
+  if (auto pv = dyn_cast_or_null<tv::PartitionViewAttr>(enc)) {
+    auto make = view.getDefiningOp<tv::MakePartitionViewOp>();
+    if (!make)
+      return info;
+    tile = pv.getTile();
+    dimMap = pv.getDimMap();
+    padding = pv.getPadding();
+    traversal.assign(tile.begin(), tile.end()); // step == size
+    source = make.getSource();
+  } else if (auto sv = dyn_cast_or_null<tv::StridedViewAttr>(enc)) {
+    auto make = view.getDefiningOp<tv::MakeStridedViewOp>();
+    if (!make)
+      return info;
+    tile = sv.getTile();
+    dimMap = sv.getDimMap();
+    padding = sv.getPadding();
+    ArrayRef<int64_t> ts = sv.getTraversalStrides();
+    traversal.assign(ts.begin(), ts.end());
+    source = make.getSource();
+  } else {
+    return info;
+  }
+
+  auto makeView = source.getDefiningOp<tv::MakeTensorViewOp>();
+  auto baseTy = dyn_cast<tv::TensorViewType>(source.getType());
+  if (!makeView || !baseTy)
+    return info;
+
+  if (tile.empty() || tile.size() != dimMap.size() ||
+      tile.size() != traversal.size() ||
+      makeView.getSizes().size() != makeView.getStrides().size() ||
+      makeView.getSizes().size() != baseTy.getStrides().size())
+    return info;
+
+  Value base = getAsMemRef(makeView.getSource(), rewriter);
+  if (!isa<MemRefType>(base.getType()))
+    return info;
+  base = castDefaultMemrefToGM(base, makeView.getLoc(), rewriter);
+
+  for (int64_t tileSize : tile)
+    if (tileSize <= 0)
+      return ViewTileInfo();
+  for (int64_t step : traversal)
+    if (step <= 0)
+      return ViewTileInfo();
+  for (unsigned i = 0; i < dimMap.size(); ++i) {
+    int64_t d = dimMap[i];
+    if (d < 0 || static_cast<size_t>(d) >= makeView.getSizes().size())
+      return ViewTileInfo();
+    for (unsigned j = 0; j < i; ++j)
+      if (dimMap[j] == d)
+        return ViewTileInfo();
+  }
+
+  info.base = base;
+  info.elementType = viewTy.getElementType();
+  info.tile.assign(tile.begin(), tile.end());
+  info.traversal = std::move(traversal);
+  info.dimMap.assign(dimMap.begin(), dimMap.end());
+  info.strideStatic.assign(baseTy.getStrides().begin(),
+                           baseTy.getStrides().end());
+  info.shape.assign(makeView.getSizes().begin(), makeView.getSizes().end());
+  info.strides.assign(makeView.getStrides().begin(),
+                      makeView.getStrides().end());
+  info.padding = padding;
+  info.ok = true;
+  return info;
+}
+
+// Compute the flat element offset of the tile selected by `indices`, and
+// optionally the per-dimension valid (in-bounds) lengths used for tail padding.
+// The tile *starts* at `index * traversal` along each view dimension; its
+// extent is `tile`. For a partition view traversal == tile, so this reduces to
+// the familiar `index * tile` start. Valid length always clamps against the
+// tile extent, independent of the traversal stride.
+static Value emitViewGeometry(OpBuilder &builder, Location loc,
+                              const ViewTileInfo &info, ValueRange indices,
+                              SmallVectorImpl<Value> *validLengths) {
+  Value offset;
+  for (unsigned viewDim = 0; viewDim < info.tile.size(); ++viewDim) {
+    unsigned baseDim = static_cast<unsigned>(info.dimMap[viewDim]);
+    Value index = asIndexValue(builder, loc, indices[viewDim]);
+    Value step =
+        builder.create<arith::ConstantIndexOp>(loc, info.traversal[viewDim]);
+    Value logical = builder.create<arith::MulIOp>(loc, index, step);
+
+    if (validLengths) {
+      Value tileSize =
+          builder.create<arith::ConstantIndexOp>(loc, info.tile[viewDim]);
+      Value extent = asIndexValue(builder, loc, info.shape[baseDim]);
+      Value remaining = builder.create<arith::SubIOp>(loc, extent, logical);
+      Value length =
+          builder.create<arith::MinSIOp>(loc, remaining, tileSize);
+      Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+      validLengths->push_back(
+          builder.create<arith::MaxSIOp>(loc, length, zero));
+    }
+
+    Value stride = asIndexValue(builder, loc, info.strides[baseDim]);
+    Value physical = builder.create<arith::MulIOp>(loc, logical, stride);
+    offset = offset ? builder.create<arith::AddIOp>(loc, offset, physical)
+                    : physical;
+  }
+  return offset;
+}
+
+// Build the GM-side memref for one tile via reinterpret_cast. The tile shape is
+// `tile` (the traversal stride only moved the start offset, not the extent),
+// so this helper is identical for partition and strided views.
+static Value emitViewGmTile(OpBuilder &builder, Location loc,
+                            const ViewTileInfo &info, Value offset) {
+  SmallVector<OpFoldResult> sizes;
+  SmallVector<OpFoldResult> strides;
+  SmallVector<int64_t> staticStrides;
+  for (unsigned viewDim = 0; viewDim < info.tile.size(); ++viewDim) {
+    unsigned baseDim = static_cast<unsigned>(info.dimMap[viewDim]);
+    sizes.push_back(builder.getIndexAttr(info.tile[viewDim]));
+    int64_t stride = info.strideStatic[baseDim];
+    staticStrides.push_back(stride);
+    if (stride == ShapedType::kDynamic)
+      strides.push_back(info.strides[baseDim]);
+    else
+      strides.push_back(builder.getIndexAttr(stride));
+  }
+
+  auto layout = StridedLayoutAttr::get(builder.getContext(),
+                                       ShapedType::kDynamic, staticStrides);
+  auto gmSpace = hivm::AddressSpaceAttr::get(builder.getContext(),
+                                             hivm::AddressSpace::GM);
+  auto gmTy =
+      MemRefType::get(info.tile, info.elementType, layout, gmSpace);
+  return builder.create<memref::ReinterpretCastOp>(
+      loc, gmTy, info.base, OpFoldResult(offset), sizes, strides);
+}
+
+// Restrict a full tile memref to its in-bounds prefix along every dimension so
+// only valid lanes are moved; the padding fill covers the rest.
+static Value emitPrefixSubview(OpBuilder &builder, Location loc, Value source,
+                               ValueRange validLengths) {
+  SmallVector<OpFoldResult> offsets;
+  SmallVector<OpFoldResult> sizes;
+  SmallVector<OpFoldResult> strides;
+  for (Value length : validLengths) {
+    offsets.push_back(builder.getIndexAttr(0));
+    sizes.push_back(OpFoldResult(length));
+    strides.push_back(builder.getIndexAttr(1));
+  }
+  return builder.create<memref::SubViewOp>(loc, source, offsets, sizes, strides);
+}
+
+static MemRefType makeSpaceMemref(MLIRContext *ctx, ArrayRef<int64_t> shape,
+                                  Type elementType, hivm::AddressSpace space) {
+  auto spaceAttr = hivm::AddressSpaceAttr::get(ctx, space);
+  return MemRefType::get(shape, elementType, MemRefLayoutAttrInterface{},
+                         spaceAttr);
+}
+
+// Resolve the on-chip memory space carried by a tile.load/tile.store into a
+// HIVM address space. A null/absent attribute means the DSL did not specify a
+// space, so we default to UB (the Vector working buffer). Generic GPU spaces
+// are rejected: they never occur on the Ascend lowering path.
+static hivm::AddressSpace
+resolveTileSpace(std::optional<tile::MemorySpace> space) {
+  if (!space)
+    return hivm::AddressSpace::UB;
+  return mapMemSpaceToHIVM(*space);
+}
+
+
+// Build the constant used to fill the out-of-bounds (tail) lanes of a boundary
+// tile according to the view's padding kind. Float element types support the
+// IEEE special pads (nan / +inf / -inf); integers only support zero.
+static Value emitPadConstant(OpBuilder &builder, Location loc, Type elementType,
+                             tv::PadKind padding) {
+  if (auto floatTy = dyn_cast<FloatType>(elementType)) {
+    const llvm::fltSemantics &sem = floatTy.getFloatSemantics();
+    llvm::APFloat value = llvm::APFloat::getZero(sem);
+    switch (padding) {
+    case tv::PadKind::Nan:
+      value = llvm::APFloat::getNaN(sem);
+      break;
+    case tv::PadKind::Inf:
+      value = llvm::APFloat::getInf(sem, /*Negative=*/false);
+      break;
+    case tv::PadKind::NInf:
+      value = llvm::APFloat::getInf(sem, /*Negative=*/true);
+      break;
+    default:
+      break;
+    }
+    return builder.create<arith::ConstantOp>(
+        loc, builder.getFloatAttr(elementType, value));
+  }
+  return builder.create<arith::ConstantOp>(loc,
+                                           builder.getZeroAttr(elementType));
+}
+
+// A tile.load/tile.store lowers through the TensorView path when its operand
+// carries a partition or strided encoding and the index count matches the
+// tile rank. Both encodings share one lowering; they differ only in traversal.
+static bool isViewLowerable(tv::TensorViewType viewTy, size_t numIndices) {
+  Attribute enc = viewTy.getEncoding();
+  if (auto pv = dyn_cast_or_null<tv::PartitionViewAttr>(enc))
+    return numIndices == pv.getTile().size();
+  if (auto sv = dyn_cast_or_null<tv::StridedViewAttr>(enc))
+    return numIndices == sv.getTile().size();
+  return false;
+}
+
+// Lower a `tile.load` off a partition/strided TensorView into a GM -> UB DMA
+// (hivm.load, MTE2). The tile geometry comes from `traceView`, so the same code
+// serves both encodings.
+static LogicalResult lowerViewLoad(tile::LoadOp op, PatternRewriter &rewriter) {
+  auto resultTy = dyn_cast<RankedTensorType>(op.getResult().getType());
+  if (!resultTy)
+    return rewriter.notifyMatchFailure(op, "expected ranked tensor result");
+
+  ViewTileInfo info = traceView(op.getSrc(), rewriter);
+  if (!info.ok || op.getIndices().size() != info.tile.size() ||
+      resultTy.getRank() != static_cast<int64_t>(info.tile.size()) ||
+      resultTy.getElementType() != info.elementType ||
+      resultTy.getShape() != ArrayRef<int64_t>(info.tile))
+    return rewriter.notifyMatchFailure(op, "unsupported TensorView load shape");
+
+  Location loc = op.getLoc();
+  // This stage lowers only the GM -> UB DMA (hivm.load, MTE2). The dst_space
+  // API is threaded end-to-end, but other on-chip spaces (L1/L0A/L0B/L0C) are
+  // reserved for a later stage and intentionally not lowered here.
+  hivm::AddressSpace dstSpace = resolveTileSpace(op.getDstSpace());
+  if (dstSpace != hivm::AddressSpace::UB)
+    return rewriter.notifyMatchFailure(
+        op, "TensorView load: dst_space other than UB is reserved");
+
+  SmallVector<Value> validLengths;
+  Value offset =
+      emitViewGeometry(rewriter, loc, info, op.getIndices(), &validLengths);
+  Value gm = emitViewGmTile(rewriter, loc, info, offset);
+  Value ub = rewriter.create<memref::AllocOp>(
+      loc, makeSpaceMemref(rewriter.getContext(), info.tile, info.elementType,
+                           dstSpace));
+
+  Value pad = emitPadConstant(rewriter, loc, info.elementType, info.padding);
+  rewriter.create<linalg::FillOp>(loc, ValueRange{pad}, ValueRange{ub});
+
+  Value gmSub = emitPrefixSubview(rewriter, loc, gm, validLengths);
+  Value ubSub = emitPrefixSubview(rewriter, loc, ub, validLengths);
+  rewriter.create<hivm::LoadOp>(loc, TypeRange{}, gmSub, ubSub);
+
+  Value tensor = rewriter.create<bufferization::ToTensorOp>(
+      loc, resultTy, ub, /*restrict=*/true, /*writable=*/false);
+  rewriter.replaceOp(op, tensor);
+  return success();
+}
+
+// Lower a `tile.store` into a partition/strided TensorView as a UB -> GM DMA
+// (hivm.store, MTE3), symmetric to lowerViewLoad.
+static LogicalResult lowerViewStore(tile::StoreOp op,
+                                    PatternRewriter &rewriter) {
+  auto valueTy = dyn_cast<RankedTensorType>(op.getSrc().getType());
+  if (!valueTy)
+    return rewriter.notifyMatchFailure(op, "expected ranked tensor source");
+
+  ViewTileInfo info = traceView(op.getDst(), rewriter);
+  if (!info.ok || op.getIndices().size() != info.tile.size() ||
+      valueTy.getRank() != static_cast<int64_t>(info.tile.size()) ||
+      valueTy.getElementType() != info.elementType ||
+      valueTy.getShape() != ArrayRef<int64_t>(info.tile))
+    return rewriter.notifyMatchFailure(op,
+                                       "unsupported TensorView store shape");
+
+  Location loc = op.getLoc();
+  // This stage lowers only the UB -> GM DMA (hivm.store, MTE3). The src_space
+  // API is threaded end-to-end, but other on-chip spaces (L0C via FixPipe,
+  // L1/L0A/L0B) are reserved for a later stage and not lowered here.
+  hivm::AddressSpace srcSpace = resolveTileSpace(op.getSrcSpace());
+  if (srcSpace != hivm::AddressSpace::UB)
+    return rewriter.notifyMatchFailure(
+        op, "TensorView store: src_space other than UB is reserved");
+
+  SmallVector<Value> validLengths;
+  Value offset =
+      emitViewGeometry(rewriter, loc, info, op.getIndices(), &validLengths);
+  Value gm = emitViewGmTile(rewriter, loc, info, offset);
+  Value ub = rewriter.create<memref::AllocOp>(
+      loc, makeSpaceMemref(rewriter.getContext(), info.tile, info.elementType,
+                           srcSpace));
+  Value gmSub = emitPrefixSubview(rewriter, loc, gm, validLengths);
+  Value ubSub = emitPrefixSubview(rewriter, loc, ub, validLengths);
+
+  SmallVector<OpFoldResult> offsets;
+  SmallVector<OpFoldResult> sizes;
+  SmallVector<OpFoldResult> strides;
+  for (Value length : validLengths) {
+    offsets.push_back(rewriter.getIndexAttr(0));
+    sizes.push_back(OpFoldResult(length));
+    strides.push_back(rewriter.getIndexAttr(1));
+  }
+  Value slice = rewriter.create<tensor::ExtractSliceOp>(
+      loc, op.getSrc(), offsets, sizes, strides);
+  auto materialize = rewriter.create<bufferization::MaterializeInDestinationOp>(
+      loc, slice, ubSub);
+  materialize->setAttr("writable", rewriter.getUnitAttr());
+  rewriter.create<hivm::StoreOp>(loc, TypeRange{}, ubSub, gmSub);
+  rewriter.eraseOp(op);
+  return success();
 }
 
 static void lowerScatteredLoad(tile::CopyOp op, Value ptr, Value buf,
@@ -420,10 +782,15 @@ struct TileLoadToHIVM : OpRewritePattern<tile::LoadOp> {
 
   LogicalResult matchAndRewrite(tile::LoadOp op,
                                 PatternRewriter &rewriter) const final {
+    if (auto viewTy = dyn_cast<tv::TensorViewType>(op.getSrc().getType())) {
+      if (isViewLowerable(viewTy, op.getIndices().size()))
+        return lowerViewLoad(op, rewriter);
+      return failure();
+    }
     auto resultTy = op.getResult().getType();
     if (auto t = dyn_cast<tile::TensorType>(resultTy)) {
       auto memrefTy = convertTensorToMemRef(t);
-      rewriter.replaceOpWithNewOp<hivm::LoadOp>(op, memrefTy, op.getOperand());
+      rewriter.replaceOpWithNewOp<hivm::LoadOp>(op, memrefTy, op.getSrc());
       return success();
     }
     return failure();
@@ -438,9 +805,16 @@ struct TileStoreToHIVM : OpRewritePattern<tile::StoreOp> {
 
   LogicalResult matchAndRewrite(tile::StoreOp op,
                                 PatternRewriter &rewriter) const final {
-    Value src = getAsMemRef(op.getOperand(0), rewriter);
-    rewriter.replaceOpWithNewOp<hivm::StoreOp>(op, Type(), src,
-                                               op.getOperand(1));
+    if (auto viewTy = dyn_cast<tv::TensorViewType>(op.getDst().getType())) {
+      if (isViewLowerable(viewTy, op.getIndices().size()))
+        return lowerViewStore(op, rewriter);
+      return failure();
+    }
+    if (!op.getIndices().empty())
+      return failure();
+    Value src = getAsMemRef(op.getSrc(), rewriter);
+    rewriter.replaceOpWithNewOp<hivm::StoreOp>(op, TypeRange{}, src,
+                                               op.getDst());
     return success();
   }
 };

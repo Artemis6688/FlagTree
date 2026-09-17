@@ -106,6 +106,20 @@ static mlir::triton::tile::MemorySpace attrToMemSpace(Attribute attr) {
   return MS::UB;
 }
 
+// Build a TileIR MemorySpaceAttr from a Python-supplied address-space
+// attribute. A null attribute (dsa_get_null_attr / default dst_space=None in
+// the DSL) yields a null MemorySpaceAttr, i.e. "unspecified" -- the
+// TileIRToHIVM lowering then falls back to UB. A non-null attribute is decoded
+// through attrToMemSpace so it works for both hivm::AddressSpaceAttr (Ascend)
+// and the legacy string form.
+static mlir::triton::tile::MemorySpaceAttr
+makeMemSpaceAttr(TritonOpBuilder &self, Attribute attr) {
+  if (!attr)
+    return mlir::triton::tile::MemorySpaceAttr();
+  return mlir::triton::tile::MemorySpaceAttr::get(self.getContext(),
+                                                  attrToMemSpace(attr));
+}
+
 void init_tle_dsa_ir(py::module &&m) {
   m.def("load_dialects", [](MLIRContext &context) {
     DialectRegistry registry;
@@ -572,5 +586,81 @@ void init_tle_dsa_ir(py::module &&m) {
              auto concatOp = builder.create<mlir::triton::tile::ConcatOp>(
                  self.getLastLoc(), resultType, lhs, rhs, dimAttr);
              return concatOp.getResult();
+           })
+      // tile.load — load from GM pointer into a tile tensor
+      .def("create_tile_load",
+           [](TritonOpBuilder &self, Value &src, Type resultTy) -> Value {
+             return self
+                 .create<mlir::triton::tile::LoadOp>(
+                     resultTy, src,
+                     /*indices=*/ValueRange{},
+                     /*engine=*/mlir::triton::tile::EngineAttr(),
+                     /*dst_space=*/mlir::triton::tile::MemorySpaceAttr())
+                 .getResult();
+           })
+      // tile.load — tensor_view + indices overload with explicit dst_space.
+      // `dstSpace` is the destination memory space carried from the DSL
+      // (ascend get_target_attribute -> hivm::AddressSpaceAttr); a null
+      // attribute means "unspecified" and the lowering defaults to UB.
+      .def("create_tile_load",
+           [](TritonOpBuilder &self, Value &src,
+              std::vector<Value> &indices, Type resultTy,
+              const Attribute &dstSpace) -> Value {
+             auto indexType = IndexType::get(self.getContext());
+             SmallVector<Value> castIndices;
+             for (auto &idx : indices) {
+               if (idx.getType().isIndex()) {
+                 castIndices.push_back(idx);
+               } else {
+                 castIndices.push_back(
+                     self.create<arith::IndexCastOp>(indexType, idx));
+               }
+             }
+             auto spaceAttr = makeMemSpaceAttr(self, dstSpace);
+             return self
+                 .create<mlir::triton::tile::LoadOp>(
+                     resultTy, src,
+                     ValueRange(castIndices),
+                     /*engine=*/mlir::triton::tile::EngineAttr(),
+                     /*dst_space=*/spaceAttr)
+                 .getResult();
+           })
+      // tile.store — store a tile tensor to GM pointer
+      .def("create_tile_store",
+           [](TritonOpBuilder &self, Value &src, Value &dst) -> void {
+             self.create<mlir::triton::tile::StoreOp>(
+                 src, dst,
+                 /*indices=*/ValueRange{},
+                 /*engine=*/mlir::triton::tile::EngineAttr(),
+                 /*src_layout=*/mlir::triton::tile::LayoutAttr(),
+                 /*dst_layout=*/mlir::triton::tile::LayoutAttr(),
+                 /*comment=*/mlir::StringAttr(),
+                 /*src_space=*/mlir::triton::tile::MemorySpaceAttr());
+           })
+      // tile.store — tensor_view + indices overload with explicit src_space.
+      // `srcSpace` is the source (on-chip) memory space the tile lives in
+      // before the store DMA; null means "unspecified" -> UB in lowering.
+      .def("create_tile_store",
+           [](TritonOpBuilder &self, Value &src, Value &dst,
+              std::vector<Value> &indices, const Attribute &srcSpace) -> void {
+             auto indexType = IndexType::get(self.getContext());
+             SmallVector<Value> castIndices;
+             for (auto &idx : indices) {
+               if (idx.getType().isIndex()) {
+                 castIndices.push_back(idx);
+               } else {
+                 castIndices.push_back(
+                     self.create<arith::IndexCastOp>(indexType, idx));
+               }
+             }
+             auto spaceAttr = makeMemSpaceAttr(self, srcSpace);
+             self.create<mlir::triton::tile::StoreOp>(
+                 src, dst,
+                 ValueRange(castIndices),
+                 /*engine=*/mlir::triton::tile::EngineAttr(),
+                 /*src_layout=*/mlir::triton::tile::LayoutAttr(),
+                 /*dst_layout=*/mlir::triton::tile::LayoutAttr(),
+                 /*comment=*/mlir::StringAttr(),
+                 /*src_space=*/spaceAttr);
            });
 }
