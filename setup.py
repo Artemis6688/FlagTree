@@ -862,8 +862,8 @@ def get_flagtree_version():
             return flagtree_ver + get_git_commit_hash().replace("+", ".")
     backend = os.environ.get("FLAGTREE_BACKEND", "")
     if backend:
-        return "0.6.0+" + backend + get_git_commit_hash().replace("+", ".")
-    return "0.6.0" + get_git_commit_hash()
+        return "0.7.0+" + backend + get_git_commit_hash().replace("+", ".")
+    return "0.7.0" + get_git_commit_hash()
 
 
 # Dynamically define supported Python versions and classifiers
@@ -894,12 +894,20 @@ setup(
     description=
     "A unified compiler supporting multiple AI chip backends for custom Deep Learning operations, which is forked from triton-lang/triton.",
     long_description=long_description,
+    license="MIT",
+    license_files=["LICENSE"],
     long_description_content_type="text/markdown",
     install_requires=[
         "importlib-metadata; python_version < '3.10'",
     ],
     packages=list(get_packages()),
     package_dir=dict(get_package_dirs()),
+    package_data={
+        # Pre-built custom-op bitcode, required at runtime by
+        # triton/experimental/tle/language/dsa/ascend/custom_ops/registry.py.
+        # Same convention as triton/backends/*/lib/libdevice.10.bc.
+        "triton.experimental.tle.language.dsa.ascend.custom_ops": ["custom_ops.bc"],
+    },
     entry_points=get_entry_points(),
     include_package_data=True,
     ext_modules=[CMakeExtension("triton", "triton/_C/")],
