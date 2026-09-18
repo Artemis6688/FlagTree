@@ -54,6 +54,8 @@ import fa_triton_arch_v2 as _fa  # noqa: E402
 _CLC_BATCHES = [1, 4, 8, 16, 32]
 _CLC_SEQLEN_PAIRS = [
     (32, 8192),       # asymmetric: decode-like
+    (256, 256),       # small symmetric (kernel min Sq)
+    (1024, 1024),     # medium symmetric
     (2048, 2048),
     (4096, 4096),
     (8192, 8192),
@@ -192,8 +194,8 @@ def _ref_sdpa(q, k, v, is_causal):
         k = k.repeat_interleave(n_rep, dim=1)
         v = v.repeat_interleave(n_rep, dim=1)
     return torch.nn.functional.scaled_dot_product_attention(
-        q.float(), k.float(), v.float(), is_causal=is_causal
-    ).to(torch.float16)
+        q, k, v, is_causal=is_causal
+    )
 
 
 # ---------------------------------------------------------------------------
