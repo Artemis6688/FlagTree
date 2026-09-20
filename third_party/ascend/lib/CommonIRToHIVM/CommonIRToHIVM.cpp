@@ -546,6 +546,34 @@ static Value emitPaddedGatherLoad(OpBuilder &b, Location loc,
   return loops.front().getResult(0);
 }
 
+// Rank-1 padded load via HIVM's native pad_mode. The GM source is subviewed
+// down to the in-bounds prefix; the UB destination is allocated at the full
+// tile extent, and hivm.load fills the trailing out-of-bounds lanes with
+// `pad` itself, driven by `right_padding_num`. Only the tail (last and only)
+// dimension can be out of bounds for a rank-1 tile, matching the operand
+// shape constraint that `verifyPadMode` enforces on hivm::LoadOp.
+static Value emitPadModeLastDimLoad(OpBuilder &b, Location loc,
+                                    const ViewTileInfo &info, Value offset,
+                                    Value validLength, hivm::AddressSpace dstSpace,
+                                    RankedTensorType resultTy, Value pad) {
+  Value gm = emitViewGmTile(b, loc, info, offset);
+  Value gmValid = emitPrefixSubview(b, loc, gm, ValueRange{validLength});
+
+  Value ub = b.create<memref::AllocOp>(
+      loc, makeSpaceMemref(b.getContext(), info.tile, info.elementType,
+                          dstSpace));
+
+  Value tileSize = b.create<arith::ConstantIndexOp>(loc, info.tile[0]);
+  Value rightPad = b.create<arith::SubIOp>(loc, tileSize, validLength);
+
+  auto padMode =
+      hivm::PadModeAttr::get(b.getContext(), hivm::PadMode::PadValue);
+  b.create<hivm::LoadOp>(loc, TypeRange{}, gmValid, ub, padMode, pad, Value(),
+                         rightPad);
+
+  return b.create<bufferization::ToTensorOp>(loc, resultTy, ub, true, false);
+}
+
 // Lower a `tile.load` off a partition/strided TensorView into a GM -> UB DMA
 // (hivm.load, MTE2). The tile geometry comes from `traceView`, so the same code
 // serves both encodings.
@@ -569,10 +597,24 @@ static LogicalResult lowerViewLoad(tile::LoadOp op, PatternRewriter &rewriter) {
     return rewriter.notifyMatchFailure(
         op, "TensorView load: dst_space other than UB is unsupported");
 
+  Value pad = emitPadConstant(rewriter, loc, info.elementType, info.padding);
+
+  // A rank-1 tile can only run out of bounds in its last (only) dimension, so
+  // HIVM's native pad_mode load covers it directly without the scalar gather.
+  if (info.tile.size() == 1) {
+    SmallVector<Value> validLengths;
+    Value offset =
+        emitViewGeometry(rewriter, loc, info, op.getIndices(), &validLengths);
+    Value tensor = emitPadModeLastDimLoad(rewriter, loc, info, offset,
+                                          validLengths[0], dstSpace, resultTy,
+                                          pad);
+    rewriter.replaceOp(op, tensor);
+    return success();
+  }
+
   // Boundary tiles may reach past the base view; a padded element-wise gather
   // fills the out-of-bounds lanes with the view's padding value and reads the
   // in-bounds lanes from GM.
-  Value pad = emitPadConstant(rewriter, loc, info.elementType, info.padding);
   Value tensor =
       emitPaddedGatherLoad(rewriter, loc, info, op.getIndices(), resultTy, pad);
   rewriter.replaceOp(op, tensor);
