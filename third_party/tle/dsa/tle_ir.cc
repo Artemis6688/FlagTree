@@ -626,7 +626,10 @@ void init_tle_dsa_ir(py::module &&m) {
              auto indexType = IndexType::get(self.getContext());
              SmallVector<Value> castIndices;
              for (auto &idx : indices) {
-               if (idx.getType().isIndex()) {
+               // Scalar coordinates lower to `index`; a tensor of
+               // gather/scatter coordinates is carried through unchanged.
+               if (idx.getType().isIndex() ||
+                   isa<RankedTensorType>(idx.getType())) {
                  castIndices.push_back(idx);
                } else {
                  castIndices.push_back(
@@ -661,7 +664,10 @@ void init_tle_dsa_ir(py::module &&m) {
              auto indexType = IndexType::get(self.getContext());
              SmallVector<Value> castIndices;
              for (auto &idx : indices) {
-               if (idx.getType().isIndex()) {
+               // Scalar coordinates lower to `index`; a tensor of
+               // gather/scatter coordinates is carried through unchanged.
+               if (idx.getType().isIndex() ||
+                   isa<RankedTensorType>(idx.getType())) {
                  castIndices.push_back(idx);
                } else {
                  castIndices.push_back(
