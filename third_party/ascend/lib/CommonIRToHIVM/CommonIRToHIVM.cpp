@@ -546,14 +546,105 @@ static ElementAccess emitElementAccess(OpBuilder &b, Location loc,
   return access;
 }
 
-// Element-wise padded gather, valid for any tile rank and for both dense and
-// gather_scatter views. One scf.for is nested per tile dimension; for each
-// element emitElementAccess resolves its base coordinate (a gather_scatter
-// sparse dimension reads it from the index tensor), and an scf.if loads from GM
-// when the element is in bounds or yields the pad constant otherwise. Because
-// the padded lane's value is produced as the element's sole definition (rather
-// than a whole-tile fill that a later DMA partially overwrites), it survives
-// backend dead-store elimination.
+// Element-wise padded gather into a caller-provided UB buffer, valid for any
+// tile rank and for both a dense boundary tile and a gather_scatter view. One
+// scf.for is nested per tile dimension; for each element emitElementAccess
+// resolves its base coordinate (a gather_scatter sparse dimension reads it
+// from the index tensor), and an scf.if loads from GM when the element is in
+// bounds or stores the pad constant otherwise. Writing element-by-element
+// into `ub` (rather than assembling a tensor) lets a dense caller share the
+// same destination buffer with its whole-tile DMA fast path.
+static void emitElementwiseFill(OpBuilder &b, Location loc,
+                                const ViewTileInfo &info, ValueRange indices,
+                                Value ub, Value pad) {
+  unsigned rank = info.tile.size();
+  Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+  Value one = b.create<arith::ConstantIndexOp>(loc, 1);
+
+  SmallVector<Value> coords;
+  OpBuilder::InsertionGuard guard(b);
+  for (unsigned d = 0; d < rank; ++d) {
+    Value upper = b.create<arith::ConstantIndexOp>(loc, info.tile[d]);
+    auto loop = b.create<scf::ForOp>(loc, zero, upper, one);
+    b.setInsertionPointToStart(loop.getBody());
+    coords.push_back(loop.getInductionVar());
+  }
+
+  ElementAccess access = emitElementAccess(b, loc, info, indices, coords);
+  auto ifOp = b.create<scf::IfOp>(
+      loc, access.inBounds,
+      [&](OpBuilder &nested, Location nestedLoc) {
+        Value elemView = emitGmElementView(nested, nestedLoc, info.base,
+                                           access.physOffset, info.elementType);
+        Value loaded =
+            nested.create<memref::LoadOp>(nestedLoc, elemView, ValueRange{zero});
+        nested.create<scf::YieldOp>(nestedLoc, loaded);
+      },
+      [&](OpBuilder &nested, Location nestedLoc) {
+        nested.create<scf::YieldOp>(nestedLoc, pad);
+      });
+  b.create<memref::StoreOp>(loc, ifOp.getResult(0), ub, coords);
+}
+
+// A dense tile is fully in bounds when every dimension's valid length
+// (computed by emitViewGeometry) covers the whole tile extent. The base
+// view's shape is a runtime value, so this can only be decided at runtime,
+// not from the static tile size alone.
+static Value emitAllInBounds(OpBuilder &b, Location loc,
+                             const ViewTileInfo &info,
+                             ValueRange validLengths) {
+  Value allIn = b.create<arith::ConstantIntOp>(loc, 1, /*width=*/1);
+  for (unsigned d = 0; d < info.tile.size(); ++d) {
+    Value tileSize = b.create<arith::ConstantIndexOp>(loc, info.tile[d]);
+    Value full = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                         validLengths[d], tileSize);
+    allIn = b.create<arith::AndIOp>(loc, allIn, full);
+  }
+  return allIn;
+}
+
+// Load a dense (partition/strided) tile, choosing at runtime between a
+// whole-tile DMA and the element-wise padded gather. Whether the tile stays
+// in bounds is a runtime property of the base view's shape, so scf.if picks
+// the branch once per tile invocation rather than at compile time. Both
+// branches fill the same UB buffer so the result has a single definition
+// regardless of which one ran: a tensor-typed scf.if result would instead
+// require both branches to bufferize to the same memory space, which a
+// whole-tile DMA and an element-wise loop do not do identically. A boundary
+// tile takes the gather branch even though the view is dense, because the
+// in-bounds region of a multi-dim tile is generally L-shaped and cannot be
+// expressed as a single rectangular subview of the whole-tile DMA.
+static Value emitDenseTileLoad(OpBuilder &b, Location loc,
+                               const ViewTileInfo &info, ValueRange indices,
+                               Value offset, ValueRange validLengths,
+                               hivm::AddressSpace dstSpace,
+                               RankedTensorType resultTy, Value pad) {
+  Value ub = b.create<memref::AllocOp>(
+      loc, makeSpaceMemref(b.getContext(), info.tile, info.elementType,
+                          dstSpace));
+  Value allInBounds = emitAllInBounds(b, loc, info, validLengths);
+  b.create<scf::IfOp>(
+      loc, allInBounds,
+      [&](OpBuilder &nested, Location nestedLoc) {
+        Value gm = emitViewGmTile(nested, nestedLoc, info, offset);
+        nested.create<hivm::LoadOp>(nestedLoc, TypeRange{}, gm, ub);
+        nested.create<scf::YieldOp>(nestedLoc);
+      },
+      [&](OpBuilder &nested, Location nestedLoc) {
+        emitElementwiseFill(nested, nestedLoc, info, indices, ub, pad);
+        nested.create<scf::YieldOp>(nestedLoc);
+      });
+  return b.create<bufferization::ToTensorOp>(loc, resultTy, ub, true, false);
+}
+
+// Element-wise padded gather for a gather_scatter view, valid for any tile
+// rank. One scf.for is nested per tile dimension; for each element
+// emitElementAccess resolves its base coordinate from the sparse dimension's
+// index tensor, and an scf.if loads from GM when the element is in bounds or
+// yields the pad constant otherwise. Because the padded lane's value is
+// produced as the element's sole definition (rather than a whole-tile fill
+// that a later DMA partially overwrites), it survives backend dead-store
+// elimination.
 static Value emitPaddedGatherLoad(OpBuilder &b, Location loc,
                                   const ViewTileInfo &info, ValueRange indices,
                                   RankedTensorType resultTy, Value pad) {
@@ -597,34 +688,6 @@ static Value emitPaddedGatherLoad(OpBuilder &b, Location loc,
       b.create<tensor::InsertOp>(loc, ifOp.getResult(0), target, coords);
   b.create<scf::YieldOp>(loc, inserted);
   return loops.front().getResult(0);
-}
-
-// Rank-1 padded load via HIVM's native pad_mode. The GM source is subviewed
-// down to the in-bounds prefix; the UB destination is allocated at the full
-// tile extent, and hivm.load fills the trailing out-of-bounds lanes with
-// `pad` itself, driven by `right_padding_num`. Only the tail (last and only)
-// dimension can be out of bounds for a rank-1 tile, matching the operand
-// shape constraint that `verifyPadMode` enforces on hivm::LoadOp.
-static Value emitPadModeLastDimLoad(OpBuilder &b, Location loc,
-                                    const ViewTileInfo &info, Value offset,
-                                    Value validLength, hivm::AddressSpace dstSpace,
-                                    RankedTensorType resultTy, Value pad) {
-  Value gm = emitViewGmTile(b, loc, info, offset);
-  Value gmValid = emitPrefixSubview(b, loc, gm, ValueRange{validLength});
-
-  Value ub = b.create<memref::AllocOp>(
-      loc, makeSpaceMemref(b.getContext(), info.tile, info.elementType,
-                          dstSpace));
-
-  Value tileSize = b.create<arith::ConstantIndexOp>(loc, info.tile[0]);
-  Value rightPad = b.create<arith::SubIOp>(loc, tileSize, validLength);
-
-  auto padMode =
-      hivm::PadModeAttr::get(b.getContext(), hivm::PadMode::PadValue);
-  b.create<hivm::LoadOp>(loc, TypeRange{}, gmValid, ub, padMode, pad, Value(),
-                         rightPad);
-
-  return b.create<bufferization::ToTensorOp>(loc, resultTy, ub, true, false);
 }
 
 // A gather_scatter view pairs each sparse dimension with a tensor-valued index
@@ -682,9 +745,11 @@ static void emitDiscreteScatter(OpBuilder &b, Location loc,
 }
 
 // Lower a `tile.load` off a TensorView. A dense (partition/strided) view maps
-// to a contiguous GM -> UB DMA (hivm.load, MTE2); a gather_scatter view maps to
-// an element-wise gather that reads each lane's sparse coordinate from its
-// index tensor. The tile geometry comes from `traceView`.
+// to a contiguous GM -> UB DMA (hivm.load, MTE2) when the tile is fully in
+// bounds, falling back to an element-wise gather at any boundary; a
+// gather_scatter view always takes the element-wise gather, since its sparse
+// dimension has no contiguous physical layout to DMA. The tile geometry
+// comes from `traceView`.
 static LogicalResult lowerViewLoad(tile::LoadOp op, PatternRewriter &rewriter) {
   auto resultTy = dyn_cast<RankedTensorType>(op.getResult().getType());
   if (!resultTy)
@@ -710,24 +775,20 @@ static LogicalResult lowerViewLoad(tile::LoadOp op, PatternRewriter &rewriter) {
 
   Value pad = emitPadConstant(rewriter, loc, info.elementType, info.padding);
 
-  // A dense rank-1 tile can only run out of bounds in its last (only)
-  // dimension, so HIVM's native pad_mode load covers it directly without the
-  // scalar gather. A gather_scatter view addresses each lane individually and
-  // always takes the element-wise path below.
-  if (info.sparseDims.empty() && info.tile.size() == 1) {
+  if (info.sparseDims.empty()) {
     SmallVector<Value> validLengths;
     Value offset =
         emitViewGeometry(rewriter, loc, info, op.getIndices(), &validLengths);
-    Value tensor = emitPadModeLastDimLoad(rewriter, loc, info, offset,
-                                          validLengths[0], dstSpace, resultTy,
-                                          pad);
+    Value tensor = emitDenseTileLoad(rewriter, loc, info, op.getIndices(),
+                                     offset, validLengths, dstSpace, resultTy,
+                                     pad);
     rewriter.replaceOp(op, tensor);
     return success();
   }
 
-  // Element-wise gather: a dense boundary tile reaches past the base view,
-  // while a gather_scatter view reads scattered rows. Either way in-bounds
-  // lanes load from GM and out-of-bounds lanes take the view's padding value.
+  // Element-wise gather: a gather_scatter view reads scattered rows, so each
+  // lane loads independently. In-bounds lanes load from GM and out-of-bounds
+  // lanes take the view's padding value.
   Value tensor =
       emitPaddedGatherLoad(rewriter, loc, info, op.getIndices(), resultTy, pad);
   rewriter.replaceOp(op, tensor);
@@ -945,6 +1006,19 @@ struct TileToTensorEliminate : OpRewritePattern<tile::ToTensorOp> {
     // Bridge the gap with UnrealizedConversionCast: memref → tensor.
     Value src = op.getOperand();
     auto resultTy = op.getResult().getType();
+    if (op->getAttr("writable")) {
+      // The caller (tle.dsa.to_tensor defaults to writable=True) expects an
+      // in-place view: custom ops use such a tensor as a DPS out and write
+      // the results back into the source buffer. Lower it to a writable
+      // bufferization.to_tensor; a plain cast would make One-Shot
+      // Bufferization copy the out into a fresh UB allocation that
+      // hivm-plan-memory cannot plan, which ends up as a `call @malloc` in
+      // the device code (AICore link failure) and a broken dataflow.
+      rewriter.replaceOpWithNewOp<bufferization::ToTensorOp>(
+          op, cast<RankedTensorType>(resultTy), src,
+          /*restrict=*/true, /*writable=*/true);
+      return success();
+    }
     if (src.getType() != resultTy) {
       auto cast = rewriter.create<UnrealizedConversionCastOp>(op.getLoc(),
                                                               resultTy, src);

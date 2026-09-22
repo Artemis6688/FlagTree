@@ -184,3 +184,25 @@ def test_partition_dst_space_padding():
     expected = torch.full_like(actual, -torch.inf)
     expected[:src_elements] = src
     torch.testing.assert_close(actual, expected)
+
+
+def test_partition_dst_space_mixed_grid():
+    # 10x10 valid region, tile 4x4, 3x3 grid covers [0,12)x[0,12): the top-left
+    # 2x2 block of tiles is fully in bounds, the last row/column of tiles runs
+    # past the valid region. Both the whole-tile DMA and the element-wise
+    # boundary path run within the same kernel launch, so this exercises the
+    # runtime branch picked per tile rather than per kernel.
+    sh, sw = 10, 10
+    block_m, block_n = 4, 4
+    dh, dw = 12, 12
+    src = torch.arange(sh * sw, dtype=torch.float32, device="npu").reshape(sh, sw)
+    actual = torch.full((dh, dw), 123.0, dtype=torch.float32, device="npu")
+
+    grid = (dh // block_m, dw // block_n)
+    partition_padding_2d_kernel[grid](src, actual, sh, sw, dh, dw,
+                                      BLOCK_M=block_m, BLOCK_N=block_n)
+
+    expected = torch.full((dh, dw), -torch.inf, device="npu")
+    expected[:sh, :sw] = src
+    torch.testing.assert_close(actual, expected)
+
